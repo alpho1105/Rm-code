@@ -1,0 +1,804 @@
+#============================================================================
+# This script adds a kind of depth for the maps.
+# Written by MGCaladtogel
+# English version (24/04/08)
+#----------------------------------------------------------------------------
+# Instructions :
+# You must add to the map's name :
+#- [M7]  : to activate Mode7
+#- [#XX] : XX is the slant angle (in degree). Default value is 0 (normal maps)
+#- [Y]   : Y-map looping
+#- [X]   : X-map looping. This option needs resources (lower fps).
+#- [A]   : animated autotiles (with 4 patterns). This option increases
+#          significantly the loading time, so it may crash for large maps
+#          (SystemStackError)
+#- [C]   : to center the map on the hero (even for small maps)
+#- [P]   : to have a fixed panorama
+#- [H]   : to have a white horizon
+#- [OV]  : Overworld Sprite Resize (a Mewsterus's script feature)
+#
+# OR :
+# see the "$mode7_maps_settings" below (l.48) to prapare your settings
+#----------------------------------------------------------------------------
+# Other commands (for events) :
+#- $scene.spriteset.tilemap.mode7_set(new_angle)
+#  To redraw the map with the new_angle
+#- $scene.spriteset.tilemap.mode7_set_p(new_angle)
+#  To redraw progressively the map from the current angle to the new
+#- $scene.spriteset.tilemap.mode7_redraw
+#  To redraw the map (useful with the following commands)
+#- $game_system.map_opacity = value
+#  To define the opacity for Mode7 maps (it needs to redraw)
+#- $game_system.map_gradual_opacity = value
+#  To define a gradual opacity for Mode7 maps (it needs to redraw)
+#  (it bugs with horizontal looping)
+#- $game_system.map_tone = Color.new(Red, Green, Blue)
+#  To define the tone for Mode7 maps (it needs to redraw)
+#- $game_system.map_gradual_tone = Tone.new(Red, Green, Blue, Gray)
+#  To define a gradual tone for Mode7 maps (it needs to redraw)
+#- $game_system.horizon = value
+#  To define the view's distance (default : 960) (it needs to redraw)
+#- $game_system.reset
+#  To initialize the previous options
+#
+#- To obtain flat events :
+# just add a comment in the event's commands list with : "Flat"
+# 
+#- To handle the height of a vertical event :
+# add a comment in the event's commands list with : "Heigth X", where X is the
+# height value ("Heigth 2" will draw the event 64 pixels above its original
+# position - you can use floats)
+#============================================================================
+# The map is drawn from all the tiles of the three layers that do not have a
+# terrain_tag's value of 1 or 2.
+# The other tiles (terrain_tag = 1 or 2) form elements that are drawn vertically,
+# like the 3rd-layer elements in the old version.
+# The 2 terrains ID used to form vertical elements
+$terrain_tags_vertical_tiles = [1,2] # You can modify these values
+# To access maps names
+$data_maps = load_data("Data/MapInfos.rxdata")
+$mode7_maps_settings = {}
+# Prepare your own settings for mode7 maps
+# Just put the first parameter in a map's name
+# For example :
+$mode7_maps_settings["Worldmap"] = ["#60", "X", "Y", "A", "H", "OV"]
+# -> will  be called  when "Worldmap" is included in the name
+$mode7_maps_settings["Smallslant"] = ["#20", "A", "S"]
+# Add any number of settings you want
+
+# enable/disable mode7 for mode7 maps (not on the fly, just when the map is loaded), enabled by default
+$enable_mode7_number = 5 # switch number : change this value !
+
+#============================================================================
+# ■ Game_System
+#----------------------------------------------------------------------------
+# Add attributes to this class
+#============================================================================
+
+class Game_System
+  attr_accessor :mode7 # false : normal map / true : mode 7
+  attr_accessor :loop_x # true : horizontal-looping map
+  attr_accessor :loop_y # true : vertical-looping map
+  attr_accessor :always_scroll # true : to center the camera around the hero
+  attr_accessor :map_tone # mode7 map's tone (Color)
+  attr_accessor :map_opacity # mode7 map's opacity (0..255)
+  attr_accessor :animated # true : animated autotiles for mode7 maps
+  attr_accessor :white_horizon # true : white line horizon for mode7 maps
+  attr_accessor :angle # mode7 map's slant angle (in degree)
+  attr_accessor :horizon # horizon's distance
+  attr_accessor :fixed_panorama # true : to fix the panorama (no scrolling any more)
+  attr_accessor :ov # true : Overworld Sprite Resize (smaller hero's sprite)
+  attr_accessor :ov_zoom # resize's value with ov
+  attr_accessor :map_gradual_opacity # mode7 map's gradual opacity (0..255)
+  attr_accessor :map_gradual_tone # mode7 map's gradual tone (Color)
+  #--------------------------------------------------------------------------
+  # * Object Initialization
+  #--------------------------------------------------------------------------
+  alias initialize_mode7_game_system initialize
+  def initialize
+    initialize_mode7_game_system
+    self.mode7 = false
+    self.loop_x = false
+    self.loop_y = false
+    self.always_scroll = false
+    self.animated = false
+    self.white_horizon = false
+    self.angle = 0
+    self.fixed_panorama = false
+    self.ov = false
+    self.ov_zoom = 0.6
+    reset
+  end
+  #--------------------------------------------------------------------------
+  # * Reset the values for opacity, tone and horizon's distance
+  #--------------------------------------------------------------------------
+  def reset
+    self.map_opacity = 255
+    self.map_tone = Color.new(0,0,0,0)
+    self.horizon = 960 # default value, equivalent to 30 tiles
+    self.map_gradual_opacity = 0
+    self.map_gradual_tone = Tone.new(0,0,0,0)
+  end
+end
+
+#============================================================================
+# ■ Tilemap_mode7
+#----------------------------------------------------------------------------
+# This new Tilemap class handles the drawing of a mode7 map
+#============================================================================
+
+class Tilemap_mode7
+  attr_accessor  :maps_list # contains map's graphics
+  attr_accessor  :map_ground # original map's graphic to handle flat events
+  attr_accessor  :tone_values # tone values for each line (Hash)
+  attr_accessor  :opacity_values # opacity values for each line (Hash)
+  attr_reader :spriteset
+  #--------------------------------------------------------------------------
+  # * Object Initialization
+  #     viewport  : viewport
+  #--------------------------------------------------------------------------
+  def initialize(viewport, spriteset)
+    @spriteset = spriteset
+    @id = $game_map.map_id # map's ID : to load or save the map in Cache
+    @maps_list = [] # contains map's drawings (Bitmap)
+    @disp_y = $game_map.display_y # @disp_y : tilemap's display_y
+    @disp_x = $game_map.display_x # @disp_x : tilemap's display_x
+    @height = 32 * $game_map.height # @height : map's height (in pixel)
+    @width = 32 * $game_map.width # @width : map's width (in pixel)
+    $game_temp.height = @height
+    # map's drawings are loaded if already in Cache
+    if RPG::Cache_Carte.in_cache(@id)
+      @map = RPG::Cache_Carte.load(@id)
+      @maps_list.push(@map)
+      @map_ground = RPG::Cache_Carte.load(@id, 4) # to handle flat events
+      if $game_system.animated
+        @map_2 = RPG::Cache_Carte.load(@id, 1)
+        @map_3 = RPG::Cache_Carte.load(@id, 2)
+        @map_4 = RPG::Cache_Carte.load(@id, 3)
+        @maps_list.push(@map_2)
+        @maps_list.push(@map_3)
+        @maps_list.push(@map_4)
+      end
+    else # draw the map and save it in the Cache
+      draw_map
+    end
+    # create vertical elements from tiles
+    data_V = Data_Vertical_Sprites.new(viewport)
+    # @sprites_V : list of vertical sprites (Sprite_V)
+    @sprites_V = data_V.list_sprites_V
+    # @sprites_V_animated : list of animated vertical sprites (Sprite_V)
+    @sprites_V_animated = data_V.list_sprites_V_animated
+    @angle = $game_system.angle # map's slant angle (in degree)
+    @distance_h = 480 # distance between the map's center and the vanishing point
+    @pivot = 256 # screenline's number of the slant's pivot
+    @index_animated = 0 # 0..3 : index of animated tiles pattern
+    @viewport = viewport
+    @tone_values = {} # list of the tone values for each line
+    @opacity_values = {} # list of the opacity values for each line
+    init_sprites(@angle) # initialize screenlines sprites
+  end
+  #--------------------------------------------------------------------------
+  # * Dispose
+  #--------------------------------------------------------------------------
+  def dispose
+    # dispose of @sprites (scanlines), @sprites_V (vertical_sprites), and
+    # @sprites_loop_x (additional scanlines for horizontal looping)
+    for sprite in @sprites + @sprites_V + @sprites_loop_x
+      sprite.dispose
+    end
+    @sprites.clear
+    @sprites_loop_x.clear
+    @sprites_V.clear
+    @sprites_V_animated.clear
+    @maps_list.clear
+    $game_system.angle = @angle
+  end
+  #--------------------------------------------------------------------------
+  # * Increase slant's angle
+  #--------------------------------------------------------------------------
+  def increase_angle
+    return if @angle == 60
+    @angle = [@angle + 2, 60].min # angle's value between 0 and 88 degrees
+    @sprites.clear
+    @sprites_loop_x.clear
+    init_sprites(@angle) # reinitialize screenlines sprites
+  end
+  #--------------------------------------------------------------------------
+  # * Decrease slant's angle
+  #--------------------------------------------------------------------------
+  def decrease_angle
+    return if @angle == 30
+    @angle = [@angle - 2, 30].max # angle's value between 0 and 88 degrees
+    @sprites.clear
+    @sprites_loop_x.clear
+    init_sprites(@angle) # reinitialize screenlines sprites
+  end
+  #--------------------------------------------------------------------------
+  # * Slide from the current angle into the target value
+  #     value  : target angle's value (in degree)
+  #--------------------------------------------------------------------------
+  def mode7_set_p(value)
+    while value > @angle
+      increase_angle
+      spriteset.update
+      Graphics.update
+    end
+    while value < @angle
+      decrease_angle
+      spriteset.update
+      Graphics.update
+    end
+  end
+  #--------------------------------------------------------------------------
+  # * Redraw the map instantaneously with the new slant angle's value
+  #     value  : target angle's value (in degree)
+  #--------------------------------------------------------------------------
+  def mode7_set(value)
+    @angle = [[value, 0].max, 89].min
+    @sprites.clear
+    @sprites_loop_x.clear
+    init_sprites(@angle) # reinitialize screenlines sprites
+    update
+    Graphics.update
+  end
+  #--------------------------------------------------------------------------
+  # * Reinitialize screenlines sprites
+  #--------------------------------------------------------------------------
+  def mode7_redraw
+    @sprites.clear
+    @sprites_loop_x.clear
+    init_sprites(@angle) # reinitialize scanlines
+    update
+    Graphics.update
+  end
+  #--------------------------------------------------------------------------
+  # * Create sprites equivalent to scanlines
+  #     value  : target angle's value (in degree)
+  #--------------------------------------------------------------------------
+  def init_sprites(angle)
+    @horizon = $game_system.horizon
+    angle_rad = (Math::PI * angle) / 180 # angle in radian
+    @sprites = [] # list of the scanlines sprites (Sprite)
+    @sprites_loop_x = [] # list of the additionnal sprites (for X-looping)
+    cos_angle = Math.cos(angle_rad)
+    sin_angle = Math.sin(angle_rad)
+    # save values in $game_temp
+    $game_temp.distance_h = @distance_h
+    $game_temp.pivot = @pivot
+    $game_temp.cos_angle = cos_angle
+    $game_temp.sin_angle = sin_angle
+    # h0, z0 : intermediate values
+    h0 = (- @distance_h * @pivot * cos_angle).to_f /
+    (@distance_h + @pivot * sin_angle) + @pivot
+    z0 = @distance_h.to_f / (@distance_h + @pivot * sin_angle)
+    $game_temp.slope_value = (1.0 - z0) / (@pivot - h0)
+    $game_temp.corrective_value = 1.0 - @pivot * $game_temp.slope_value
+    last_line = - @pivot - @horizon # last_line : the highest line that is drawn
+    height_limit = (@distance_h * last_line * cos_angle).to_f /
+    (@distance_h - last_line * sin_angle) + @pivot # the line corresponding to
+    # the last_line in the warped reference = horizon's line
+    $game_temp.height_limit = height_limit
+    # constant to handle gradual opacity
+    k2lim = ((@distance_h * last_line).to_f /
+      (@distance_h * cos_angle + last_line * sin_angle)).to_i
+    # one sprite is created for each screenline
+    for j in 0..479
+      next if j < height_limit # if the line is further than the horizon's line,
+      # no sprite is created
+      i = j - @pivot # y-reference is the pivot's line
+      sprite = Sprite.new(@viewport)
+      sprite.x = 320 # x-reference is the vertical line in the middle of the screen
+      sprite.y = j
+      sprite.z = - 99999 # map must not mask vertical elements
+      sprite.y_origin_bitmap = (@distance_h * i).to_f /
+      (@distance_h * cos_angle + i * sin_angle) + @pivot
+      sprite.y_origin_bitmap_i = (sprite.y_origin_bitmap + 0.5).to_i
+      sprite.y_origin_bitmap_i %= @height if $game_system.loop_y
+      sprite.zoom_x = $game_temp.slope_value * j + $game_temp.corrective_value
+      sprite.length = 2 + (640.to_f / sprite.zoom_x).to_i
+      sprite.x_origin_bitmap_i = ((642 - sprite.length) / 2)
+      sprite.x_origin_bitmap_i %= @width if $game_system.loop_x
+      sprite.x_origin_bitmap = (sprite.x_origin_bitmap_i).to_f
+      sprite.ox = sprite.length / 2
+      sprite.bitmap = @map
+      # horizontal translation to center around the hero
+      if @disp_x != 0
+        sprite.x_origin_bitmap += @disp_x / 4
+        sprite.x_origin_bitmap_i = (sprite.x_origin_bitmap).to_i
+        sprite.x_origin_bitmap_i %= @width if $game_system.loop_x
+      end
+      # vertical translation to center around the hero
+      if @disp_y != 0
+        sprite.y_origin_bitmap += @disp_y / 4
+        sprite.y_origin_bitmap_i = (sprite.y_origin_bitmap + 0.5).to_i
+        sprite.y_origin_bitmap_i %= @height if $game_system.loop_y
+      end
+      # handle opacity and tone
+      k2 = ((@distance_h * i).to_f /
+      (@distance_h * cos_angle + i * sin_angle)).to_i
+      k2 = 0 if k2 > 0
+      k_red = (- k2.to_f/k2lim * $game_system.map_gradual_tone.red).to_i
+      k_green = (- k2.to_f/k2lim * $game_system.map_gradual_tone.green).to_i
+      k_blue = (- k2.to_f/k2lim * $game_system.map_gradual_tone.blue).to_i
+      k_gray = (- k2.to_f/k2lim * $game_system.map_gradual_tone.gray).to_i
+      k2 = (- k2.to_f/k2lim * $game_system.map_gradual_opacity).to_i
+      sprite.tone = Tone.new(k_red, k_green, k_blue, k_gray)
+      sprite.opacity = 255 - k2
+      sprite.opacity *= ($game_system.map_opacity).to_f / 255
+      sprite.color = $game_system.map_tone
+      # white horizon's line
+      k = j - height_limit
+      k = 500 / k
+      if $game_system.white_horizon
+        tone_red = sprite.tone.red + k
+        tone_green = sprite.tone.green + k
+        tone_blue = sprite.tone.blue + k
+        tone_gray = sprite.tone.gray + k
+        sprite.tone = Tone.new(tone_red, tone_green, tone_blue, tone_gray)
+      end
+      @tone_values[j] = sprite.tone
+      @opacity_values[j] = sprite.opacity
+      # set sprite's graphics
+      sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+      sprite.length, 1)
+      @sprites.push(sprite)
+      if $game_system.loop_x and j < @pivot
+        # additional sprite to handle horizontal looping
+        sprite2 = Sprite.new(@viewport)
+        sprite2.x = 320
+        sprite2.y = j
+        sprite2.z = - 99999
+        sprite2.y_origin_bitmap = sprite.y_origin_bitmap
+        sprite2.y_origin_bitmap_i = sprite.y_origin_bitmap_i
+        sprite2.zoom_x = sprite.zoom_x
+        sprite2.length = sprite.length
+        sprite2.x_origin_bitmap_i = sprite.x_origin_bitmap_i - @width
+        sprite2.x_origin_bitmap = sprite.x_origin_bitmap_i - @width
+        sprite2.ox = sprite.ox
+        sprite2.bitmap = @map
+        sprite2.opacity = sprite.opacity
+        sprite2.color = sprite.color
+        sprite2.tone = sprite.tone
+        sprite2.src_rect.set(sprite2.x_origin_bitmap_i, sprite2.y_origin_bitmap_i,
+        sprite2.length, 1)
+        @sprites_loop_x.push(sprite2)
+      end
+    end
+  end
+  #--------------------------------------------------------------------------
+  # * Update the screenlines sprites and the vertical sprites
+  #   compare tilemap's display with map's display
+  #--------------------------------------------------------------------------
+  def update
+    # update screenlines sprites
+    if @disp_y < $game_map.display_y
+      difference = $game_map.display_y - @disp_y
+      @disp_y += difference
+      for sprite in @sprites + @sprites_loop_x
+        sprite.y_origin_bitmap += difference.to_f / 4
+        sprite.y_origin_bitmap_i = (sprite.y_origin_bitmap+0.5).to_i
+        sprite.y_origin_bitmap_i %= @height if $game_system.loop_y
+        sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+        sprite.length, 1)
+      end
+    end
+    if @disp_y > $game_map.display_y
+      difference = @disp_y - $game_map.display_y
+      @disp_y -= difference
+      for sprite in @sprites + @sprites_loop_x
+        sprite.y_origin_bitmap -= difference.to_f / 4
+        sprite.y_origin_bitmap_i = (sprite.y_origin_bitmap+0.5).to_i
+        sprite.y_origin_bitmap_i %= @height if $game_system.loop_y
+        sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+        sprite.length, 1)
+      end
+    end
+    if @disp_x < $game_map.display_x
+      difference = $game_map.display_x - @disp_x
+      @disp_x += difference
+      for sprite in @sprites
+        sprite.x_origin_bitmap += difference.to_f / 4
+        sprite.x_origin_bitmap_i = (sprite.x_origin_bitmap).to_i
+        sprite.x_origin_bitmap_i %= @width if $game_system.loop_x
+        sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+        sprite.length, 1)
+      end
+      for sprite in @sprites_loop_x
+        sprite.x_origin_bitmap += difference.to_f / 4
+        sprite.x_origin_bitmap_i = (sprite.x_origin_bitmap).to_i
+        sprite.x_origin_bitmap_i %= @width
+        sprite.x_origin_bitmap_i -= @width
+        sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+        sprite.length, 1)
+      end
+    end
+    if @disp_x > $game_map.display_x
+      difference = @disp_x - $game_map.display_x
+      @disp_x -= difference
+      for sprite in @sprites
+        sprite.x_origin_bitmap -= difference.to_f / 4
+        sprite.x_origin_bitmap_i = (sprite.x_origin_bitmap).to_i
+        sprite.x_origin_bitmap_i %= @width if $game_system.loop_x
+        sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+        sprite.length, 1)
+      end
+      for sprite in @sprites_loop_x
+        sprite.x_origin_bitmap -= difference.to_f / 4
+        sprite.x_origin_bitmap_i = (sprite.x_origin_bitmap).to_i
+        sprite.x_origin_bitmap_i %= @width
+        sprite.x_origin_bitmap_i -= @width
+        sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+        sprite.length, 1)
+      end
+    end
+    # update vertical sprites
+    for sprite in @sprites_V
+      sprite.update
+    end
+  end
+  #--------------------------------------------------------------------------
+  # * Update animation for animated tiles
+  #--------------------------------------------------------------------------
+  def update_animated
+    @index_animated += 1
+    @index_animated %= 4
+    map = @maps_list[@index_animated]
+    # update screenlines sprites
+    for sprite in @sprites + @sprites_loop_x
+      sprite.bitmap = map
+      sprite.src_rect.set(sprite.x_origin_bitmap_i, sprite.y_origin_bitmap_i,
+      sprite.length, 1)
+    end
+    # update vertical sprites
+    for sprite in @sprites_V_animated
+      sprite.update_animated(@index_animated)
+    end
+  end
+  #--------------------------------------------------------------------------
+  # * Create bitmaps representing the map
+  #--------------------------------------------------------------------------
+  def draw_map
+    data = $game_map.data
+    # Table where animated tiles are flagged
+    data_animated = Table.new($game_map.width, $game_map.height)
+    # bigger maps to handle horizontal looping
+    offset = ($game_system.loop_x ? 640 : 0)
+    @map = Bitmap.new(@width + offset, @height)
+    @maps_list.push(@map)
+    rect = Rect.new(0, 0, 32, 32)
+    # create autotiles graphics
+    RPG::Cache.clear
+    @autotiles = []
+    for i in 0..6
+      autotile_name = $game_map.autotile_names[i]
+      fichier = RPG::Cache.autotile(autotile_name)
+      for l in 0..3
+        data_autotile = Data_Autotiles.new(fichier,l)
+        data_autotile.number = 4*i + l
+        RPG::Cache.save_autotile(data_autotile, data_autotile.number)
+        @autotiles.push(data_autotile)
+      end
+    end
+    # scan map's data to draw it
+    for i in 0...$game_map.height
+      for j in 0...$game_map.width
+        data_animated[j, i] = 0
+        # tile's ID for the first layer
+        value1 = data[j, i, 0].to_i
+        # prevent from drawing a vertical tile
+        value1 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value1]) ?
+        0 : value1)
+        # value1 != 0
+        if value1 != 0
+          # tile's ID for the second layer
+          value2 = data[j, i, 1].to_i
+          # prevent from drawing a vertical tile
+          value2 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value2]) ?
+          0 : value2)
+          # tile's ID for the third layer
+          value3 = data[j, i, 2].to_i
+          # prevent from drawing a vertical tile
+          value3 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value3]) ?
+          0 : value3)
+          # value1 != 0, value2 = 0
+          if value2 == 0
+            # value1 != 0, value2 = 0, value3 = 0
+            if value3 == 0
+              # value1 associated with a normal autotile
+              if value1 > 383
+                bitmap = RPG::Cache.tile($game_map.tileset_name, value1, 0)
+                @map.blt(32*j, 32*i, bitmap, rect)
+                if $game_system.loop_x and j.between?(0, 19)
+                  @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+                end
+              # value1 associated with an autotile
+              else
+                num = 4*((value1 / 48) - 1)
+                bitmap = RPG::Cache.autotile_base(num, value1)
+                if @autotiles[num].animated
+                  data_animated[j, i] = 1
+                end
+                @map.blt(32*j, 32*i, bitmap, rect)
+                if $game_system.loop_x and j.between?(0, 19)
+                  @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+                end
+              end
+            # value1 != 0, value2 = 0, value3 != 0
+            else
+              bitmap = RPG::Cache_Tile.load(value1, value3)
+              # value1 associated with an autotile
+              if value1 < 384
+                num = 4*((value1 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              # value3 associated with an autotile
+              if value3 < 384
+                num = 4*((value3 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              @map.blt(32*j, 32*i, bitmap, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+              end
+            end
+          # value1 != 0, value2 != 0
+          else
+            # value1 != 0, value2 != 0, value3 = 0
+            if value3 == 0
+              bitmap = RPG::Cache_Tile.load(value1, value2)
+              # value1 associated with an autotile
+              if value1 < 384
+                num = 4*((value1 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              # value2 associated with an autotile
+              if value2 < 384
+                num = 4*((value2 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              @map.blt(32*j, 32*i, bitmap, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+              end
+            # value1 != 0, value2 != 0, value3 != 0
+            else
+              bitmap = RPG::Cache_Tile.load2(value1, value2, value3)
+              # value1 associated with an autotile
+              if value1 < 384
+                num = 4*((value1 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              # value2 associated with an autotile
+              if value2 < 384
+                num = 4*((value2 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              # value3 associated with an autotile
+              if value3 < 384
+                num = 4*((value3 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              @map.blt(32*j, 32*i, bitmap, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+              end
+            end
+          end
+        # value1 = 0
+        else
+          value2 = data[j, i, 1].to_i
+          value2 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value2]) ?
+          0 : value2)
+          value3 = data[j, i, 2].to_i
+          value3 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value3]) ?
+          0 : value3)
+          # value1 = 0, value2 = 0
+          if value2 == 0
+            # value1 = 0, value2 = 0, value3 != 0
+            if value3 != 0
+              # value3 associated with a normal tile
+              if value3 > 383
+                bitmap = RPG::Cache.tile($game_map.tileset_name, value3, 0)
+                @map.blt(32*j, 32*i, bitmap, rect)
+                if $game_system.loop_x and j.between?(0, 19)
+                  @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+                end
+              # value3 associated with an autotile
+              else
+                num = 4*((value3 / 48) - 1)
+                bitmap = RPG::Cache.autotile_base(num, value3)
+                if @autotiles[num].animated
+                  data_animated[j, i] = 1
+                end
+                @map.blt(32*j, 32*i, bitmap, rect)
+                if $game_system.loop_x and j.between?(0, 19)
+                  @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+                end
+              end
+            end
+          # value1 = 0, value2 != 0
+          else
+            # value1 = 0, value2 != 0, value3 = 0
+            if value3 == 0
+              # value2 associated with a normal tile
+              if value2 > 383
+                bitmap = RPG::Cache.tile($game_map.tileset_name, value2, 0)
+                @map.blt(32*j, 32*i, bitmap, rect)
+                if $game_system.loop_x and j.between?(0, 19)
+                  @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+                end
+              # value2 associated with an autotile
+              else
+                num = 4*((value2 / 48) - 1)
+                bitmap = RPG::Cache.autotile_base(num, value2)
+                if @autotiles[num].animated
+                  data_animated[j, i] = 1
+                end
+                @map.blt(32*j, 32*i, bitmap, rect)
+                if $game_system.loop_x and j.between?(0, 19)
+                  @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+                end
+              end
+            # value1 = 0, value2 != 0, value3 != 0
+            else
+              bitmap = RPG::Cache_Tile.load(value2, value3)
+              # value2 associated with an autotile
+              if value2 < 384
+                num = 4*((value2 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              # value3 associated with an autotile
+              if value3 < 384
+                num = 4*((value3 / 48) - 1)
+                data_animated[j, i] = 1 if @autotiles[num].animated
+              end
+              @map.blt(32*j, 32*i, bitmap, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map.blt(32*(j+$game_map.width), 32*i, bitmap, rect)
+              end
+            end
+          end
+        end
+      end
+    end
+    # save the map's drawing in the Cache
+    RPG::Cache_Carte.save(@id, @map)
+    @map_ground = @map.clone
+    # save a copy of the map to handle flat events
+    RPG::Cache_Carte.save(@id, @map_ground, 4)
+    return if !$game_system.animated
+    # create 3 other maps in case of animated tiles
+    @map_2 = @map.clone
+    @map_3 = @map.clone
+    @map_4 = @map.clone
+    @maps_list.push(@map_2)
+    @maps_list.push(@map_3)
+    @maps_list.push(@map_4)
+    for i in 0...$game_map.height
+      for j in 0...$game_map.width
+        next if data_animated[j, i].to_i == 0
+        # modify the tile if it is flagged as animated
+        value1 = data[j, i, 0].to_i
+        value2 = data[j, i, 1].to_i
+        value3 = data[j, i, 2].to_i
+        # prevent from drawing a vertical tile
+        value1 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value1]) ?
+        0 : value1)
+        value2 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value2]) ?
+        0 : value2)
+        value3 = ($terrain_tags_vertical_tiles.include?($game_map.terrain_tags[value3]) ?
+        0 : value3)
+        if value1 != 0
+          if value2 == 0
+            if value3 == 0
+              num = 4*((value1 / 48) - 1)
+              bitmap_2 = RPG::Cache.autotile_base(num+1, value1)
+              bitmap_3 = RPG::Cache.autotile_base(num+2, value1)
+              bitmap_4 = RPG::Cache.autotile_base(num+3, value1)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            else
+              bitmap_2 = RPG::Cache_Tile.load(value1, value3, 1)
+              bitmap_3 = RPG::Cache_Tile.load(value1, value3, 2)
+              bitmap_4 = RPG::Cache_Tile.load(value1, value3, 3)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            end
+          else
+            if value3 == 0
+              bitmap_2 = RPG::Cache_Tile.load(value1, value2, 1)
+              bitmap_3 = RPG::Cache_Tile.load(value1, value2, 2)
+              bitmap_4 = RPG::Cache_Tile.load(value1, value2, 3)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            else
+              bitmap_2 = RPG::Cache_Tile.load2(value1, value2, value3, 1)
+              bitmap_3 = RPG::Cache_Tile.load2(value1, value2, value3, 2)
+              bitmap_4 = RPG::Cache_Tile.load2(value1, value2, value3, 3)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            end
+          end
+        else
+          if value2 != 0
+            if value3 == 0
+              num = 4*((value2 / 48) - 1)
+              bitmap_2 = RPG::Cache.autotile_base(num+1, value2)
+              bitmap_3 = RPG::Cache.autotile_base(num+2, value2)
+              bitmap_4 = RPG::Cache.autotile_base(num+3, value2)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            else
+              bitmap_2 = RPG::Cache_Tile.load(value2, value3, 1)
+              bitmap_3 = RPG::Cache_Tile.load(value2, value3, 2)
+              bitmap_4 = RPG::Cache_Tile.load(value2, value3, 3)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            end
+          else
+            if value3 != 0
+              num = 4*((value3 / 48) - 1)
+              bitmap_2 = RPG::Cache.autotile_base(num+1, value3)
+              bitmap_3 = RPG::Cache.autotile_base(num+2, value3)
+              bitmap_4 = RPG::Cache.autotile_base(num+3, value3)
+              @map_2.blt(32*j, 32*i, bitmap_2, rect)
+              @map_3.blt(32*j, 32*i, bitmap_3, rect)
+              @map_4.blt(32*j, 32*i, bitmap_4, rect)
+              if $game_system.loop_x and j.between?(0, 19)
+                @map_2.blt(32*(j+$game_map.width), 32*i, bitmap_2, rect)
+                @map_3.blt(32*(j+$game_map.width), 32*i, bitmap_3, rect)
+                @map_4.blt(32*(j+$game_map.width), 32*i, bitmap_4, rect)
+              end
+            end
+          end
+        end
+      end
+    end
+    # save the three additional maps in the Cache
+    RPG::Cache_Carte.save(@id, @map_2, 1)
+    RPG::Cache_Carte.save(@id, @map_3, 2)
+    RPG::Cache_Carte.save(@id, @map_4, 3)
+  end
+  #--------------------------------------------------------------------------
+  # * no tileset for mode7 maps
+  #--------------------------------------------------------------------------
+  def tileset
+    return nil
+  end
+end
